@@ -1,0 +1,867 @@
+\documentclass[11pt]{report}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amsmath, amssymb, amsthm, mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{float}
+\usepackage{setspace}
+\usepackage{fancyhdr}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!50!black,
+    citecolor=blue!50!black,
+    urlcolor=blue!50!black,
+    pdftitle={SAANS Project Design Document},
+    pdfauthor={OpenAI Assistant}
+}
+
+\onehalfspacing
+\setlength{\parskip}{0.5em}
+\setlength{\parindent}{0pt}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{SAANS Design Document}
+\rhead{\thepage}
+\setlength{\headheight}{14pt}
+
+\lstdefinestyle{codeblock}{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    columns=fullflexible,
+    keepspaces=true,
+    showstringspaces=false,
+    backgroundcolor=\color{black!2}
+}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\pbase}{p_0}
+\newcommand{\padapt}{p_a}
+\newcommand{\loss}{\mathcal{L}}
+\newcommand{\obj}{\mathcal{J}}
+\newcommand{\data}{\mathcal{D}}
+\newcommand{\bins}{\mathcal{B}}
+
+\begin{document}
+
+\hypersetup{pageanchor=false}
+\begin{titlepage}
+    \centering
+    {\LARGE \textbf{Implementation Design Document}}\\[1.25em]
+    {\Huge \textbf{SAANS}}\\[0.5em]
+    {\Large Symmetry-Safe Adaptive Noise Scheduling for E(3)-Equivariant Diffusion Training}\\[1.5em]
+    {\large Research-to-Implementation Blueprint for an EECE 571F Project}\\[3em]
+
+    \begin{minipage}{0.88\textwidth}
+        \textbf{Purpose.} This document converts the project idea into an implementation-ready technical plan. It is written to support four outcomes simultaneously:
+        \begin{enumerate}[leftmargin=2em]
+            \item a correct and reproducible baseline reproduction,
+            \item a principled implementation of the SAANS scheduler,
+            \item a rigorous experimental study suitable for a strong course project, and
+            \item a foundation that can be extended into a workshop or main-track research submission if empirical results are strong.
+        \end{enumerate}
+    \end{minipage}
+
+    \vfill
+
+    {\large Version 1.0}\\
+    {\large \today}
+\end{titlepage}
+\hypersetup{pageanchor=true}
+
+\tableofcontents
+\clearpage
+
+\chapter{Executive Summary}
+
+The project studies whether diffusion training for 3D molecular generation can be made more efficient by \emph{adaptively reallocating training effort across noise levels} without changing the original objective. The core method, SAANS, changes how timesteps are sampled during training while preserving the baseline target objective using importance weighting. The scheduler must also be \emph{symmetry-safe}: difficulty estimates should not depend on arbitrary rotations or translations of a molecule.
+
+This design document assumes the implementation will begin from an existing E(3)-equivariant molecular diffusion baseline, then add a modular timestep-sampling subsystem rather than changing the backbone architecture. The key engineering principle is to separate \textbf{model code}, \textbf{diffusion/noising code}, and \textbf{sampling policy code}, so that SAANS can be switched on and off cleanly for controlled experimentation.
+
+The recommended execution path is:
+
+\begin{enumerate}[leftmargin=2em]
+    \item reproduce a baseline on QM9,
+    \item instrument per-timestep loss and variance diagnostics,
+    \item implement bin-wise adaptive timestep sampling with objective-preserving reweighting,
+    \item validate correctness on toy problems and unit tests,
+    \item run the main QM9 ablation study,
+    \item extend to a harder dataset or setting if results justify it.
+\end{enumerate}
+
+\chapter{Research Motivation and Project Scope}
+
+\section{What problem this project solves}
+
+Diffusion models train by corrupting data with noise at different timesteps and asking a model to predict denoising targets. In practice, not all timesteps are equally informative or equally difficult. A fixed or hand-designed sampling schedule may overspend compute on easy regions of the noise space and undersample difficult ones.
+
+For E(3)-equivariant molecular diffusion, this issue is especially interesting because:
+
+\begin{itemize}[leftmargin=2em]
+    \item the denoising problem changes significantly across low-, mid-, and high-noise regimes,
+    \item optimization may suffer from high variance if the training distribution is poorly allocated, and
+    \item any adaptive strategy must respect 3D geometric symmetries.
+\end{itemize}
+
+The central question is therefore:
+
+\begin{quote}
+Can we adaptively allocate training probability mass toward the currently difficult timestep regions in E(3)-equivariant diffusion, while preserving the original training objective and maintaining symmetry-consistent behavior?
+\end{quote}
+
+\section{Primary contribution}
+
+This project does \textbf{not} aim to invent a new molecular diffusion backbone. Instead, it contributes a \textbf{training-time scheduling mechanism} with three intended properties:
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Objective preservation:} adaptive timestep sampling should still optimize the same baseline objective in expectation.
+    \item \textbf{Symmetry safety:} hardness estimates used by the scheduler should be invariant to rigid geometric transformations when appropriate.
+    \item \textbf{Optimization relevance:} the method should reduce wasted compute, improve sample efficiency, or reduce optimization variance relative to static schedules.
+\end{enumerate}
+
+\section{Scope boundaries}
+
+To keep the project publishable-capable but still finishable, the initial scope should remain narrow:
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{In scope:} baseline reproduction, adaptive scheduler implementation, correctness validation, diagnostics, ablations, QM9 study, optional harder benchmark.
+    \item \textbf{Out of scope initially:} changing the backbone network, proposing a new chemistry objective, building a new benchmark from scratch, or mixing multiple independent research ideas in the first version.
+\end{itemize}
+
+\chapter{Technical Background and Notation}
+
+\section{Data representation}
+
+Let a molecular example be represented as
+\[
+x = (\mathbf{r}, \mathbf{z}),
+\]
+where $\mathbf{r} \in \R^{N \times 3}$ denotes atomic coordinates and $\mathbf{z}$ contains node features such as atom types or learned categorical embeddings. Depending on the selected baseline, the model may predict coordinate noise, score functions, denoised coordinates, or a combination of coordinate and feature outputs.
+
+\section{Baseline diffusion objective}
+
+Let $t$ denote a diffusion timestep or continuous noise level. Baseline training samples $t \sim \pbase(t)$ and optimizes
+\[
+\obj(\theta) = \E_{x \sim p_{\text{data}},\, t \sim \pbase}\big[\loss_\theta(x, t)\big].
+\]
+
+The exact form of $\loss_\theta$ depends on the backbone. The design in this document intentionally remains agnostic to whether the model is formulated in DDPM, score-based, or EDM-style notation. The only hard requirement is that the implementation can expose \emph{per-example} or \emph{per-bin} detached loss statistics to the scheduler.
+
+\section{Equivariance and invariance requirements}
+
+For molecular generation in 3D, rigid transformations of the coordinates should not alter the semantic identity of a sample. We therefore rely on the following principles:
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Equivariance:} if the input coordinates are rotated, the model's vector-valued outputs should rotate in the corresponding way.
+    \item \textbf{Invariance:} scalar diagnostics used by the scheduler should not depend on arbitrary orientation or translation.
+\end{itemize}
+
+This means the scheduler should be driven by invariant hardness summaries, not raw coordinate-frame-dependent heuristics.
+
+\section{Bin-wise formulation for practical implementation}
+
+A continuous adaptive density over $t$ is possible in principle, but a \textbf{bin-wise formulation} is much easier to implement robustly in existing codebases. Partition the timestep domain into disjoint bins
+\[
+I_1, I_2, \dots, I_B.
+\]
+
+Define baseline bin masses
+\[
+p_{0,b} = \Pr_{t \sim \pbase}(t \in I_b).
+\]
+
+The adaptive scheduler will sample a bin $b$ first, then draw $t$ from the \emph{baseline conditional distribution inside that bin}. This design has three major benefits:
+
+\begin{enumerate}[leftmargin=2em]
+    \item it simplifies importance weights,
+    \item it prevents implementation drift away from the baseline time parameterization, and
+    \item it works in both discrete-time and continuous-time diffusion codebases.
+\end{enumerate}
+
+\chapter{Formal SAANS Method Design}
+
+\section{Core adaptive objective}
+
+Let the scheduler define an adaptive bin distribution $q_b$ over bins. The adaptive sampling procedure is:
+
+\begin{enumerate}[leftmargin=2em]
+    \item sample bin $b \sim q$,
+    \item sample $t \sim \pbase(t \mid t \in I_b)$,
+    \item compute the model loss $\loss_\theta(x,t)$,
+    \item weight the loss by
+    \[
+    w_b = \frac{p_{0,b}}{q_b}.
+    \]
+\end{enumerate}
+
+Then the weighted objective estimator is
+\[
+\tilde{\obj}(\theta) = \E_{x \sim p_{\text{data}},\, b \sim q,\, t \sim \pbase(\cdot \mid I_b)}\big[w_b\,\loss_\theta(x,t)\big].
+\]
+
+Because the conditional within each bin remains the baseline conditional, the ratio simplifies to a constant within each bin. This is one of the most implementation-friendly aspects of the method.
+
+\section{Hardness statistics}
+
+Each bin maintains a detached hardness estimate $S_b$. The scheduler should never update hardness using tensors that keep gradient history. All scheduler state must be maintained under \texttt{torch.no\_grad()} or an equivalent non-differentiable update path.
+
+Recommended hardness candidates are:
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Invariant coordinate hardness:}
+    \[
+    h^{\text{coord}} = \frac{1}{N}\sum_{i=1}^N \lVert \hat{\epsilon}_i - \epsilon_i \rVert_2^2,
+    \]
+    where the aggregated norm is rotation-invariant.
+    \item \textbf{Feature hardness:} detached feature loss such as cross-entropy or feature MSE, depending on the baseline.
+    \item \textbf{Combined hardness:}
+    \[
+    h^{\text{combo}} = \lambda_{\text{coord}} h^{\text{coord}} + \lambda_{\text{feat}} h^{\text{feat}}.
+    \]
+\end{enumerate}
+
+The initial implementation should start with one scalar hardness value per training sample, then aggregate by bin inside a minibatch.
+
+\section{EMA update rule}
+
+For each bin $b$, maintain an exponential moving average
+\[
+S_b^{(n)} = \beta S_b^{(n-1)} + (1-\beta)\,\bar{h}_b^{(n)},
+\]
+where $\bar{h}_b^{(n)}$ is the mean hardness among samples from bin $b$ in iteration $n$, and $\beta \in [0,1)$ is a smoothing constant.
+
+Design requirements for the EMA subsystem:
+
+\begin{itemize}[leftmargin=2em]
+    \item missing bins in a minibatch should leave their EMA unchanged,
+    \item all state updates must be numerically safe under mixed precision,
+    \item the tracker should record both raw batch hardness and smoothed hardness,
+    \item the implementation should support resetting, warm-starting, and checkpoint serialization.
+\end{itemize}
+
+\section{Adaptive probability construction}
+
+Define positive bin scores using hardness values:
+\[
+u_b = (\varepsilon + S_b)^\alpha,
+\]
+where $\alpha \ge 0$ controls how aggressively the scheduler concentrates on difficult bins and $\varepsilon > 0$ prevents degenerate zero scores.
+
+The unregularized adaptive distribution is
+\[
+\tilde{q}_b = \frac{p_{0,b} u_b}{\sum_{j=1}^{B} p_{0,j}u_j}.
+\]
+
+To ensure full support and improve stability, mix with the baseline distribution:
+\[
+q_b = (1-\rho)\tilde{q}_b + \rho p_{0,b}, \qquad 0 < \rho \le 1.
+\]
+
+This baseline mixing is mandatory in the reference implementation because it guarantees $q_b > 0$ whenever $p_{0,b} > 0$ and prevents catastrophic weight explosion.
+
+\section{Importance weights and stabilization}
+
+The default, theoretically clean implementation uses
+\[
+w_b = \frac{p_{0,b}}{q_b}.
+\]
+
+The design document recommends the following stabilization strategy:
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Warm start:} use the baseline schedule only for the first $N_{\text{warm}}$ steps.
+    \item \textbf{Floor mixing:} enforce baseline mixing with parameter $\rho$ as above.
+    \item \textbf{Monitoring before clipping:} log the full weight histogram first.
+    \item \textbf{Optional clipped variant:} if clipping is introduced, it must be treated as a separate ablation because it changes the estimator.
+\end{enumerate}
+
+The unclipped weighted estimator should remain the primary reported method. A clipped variant may be useful as an engineering fallback but should not replace the main experiment unless numerical instability makes it unavoidable.
+
+\section{Reference training loop}
+
+The intended training procedure is:
+
+\begin{lstlisting}[style=codeblock]
+for step in range(num_steps):
+    batch = next(data_loader)
+
+    if step < warmup_steps:
+        t, bin_idx, q = baseline_sampler.sample(batch_size)
+    else:
+        t, bin_idx, q = saans_sampler.sample(batch_size)
+
+    noisy_batch, targets = diffuser.corrupt(batch, t)
+    outputs = model(noisy_batch, t)
+
+    per_example_loss, loss_parts = loss_fn(outputs, targets, return_components=True)
+    weights = sampler.importance_weights(bin_idx)
+    weighted_loss = (weights * per_example_loss).mean()
+
+    optimizer.zero_grad(set_to_none=True)
+    weighted_loss.backward()
+    optimizer.step()
+
+    with no_grad():
+        hardness = hardness_builder(loss_parts, outputs, targets)
+        sampler.update(bin_idx, hardness)
+        logger.log(step, q, weights, per_example_loss, weighted_loss, hardness)
+\end{lstlisting}
+
+\section{Implementation invariants}
+
+The following properties must hold in the final system:
+
+\begin{enumerate}[leftmargin=2em]
+    \item setting $\alpha = 0$ must recover the baseline schedule exactly,
+    \item setting $\rho = 1$ must recover the baseline schedule exactly,
+    \item the support condition $q_b > 0$ for all bins with $p_{0,b} > 0$ must always hold,
+    \item scheduler updates must be detached from the computation graph,
+    \item checkpoint restore must reproduce the scheduler state exactly,
+    \item metric logging must include enough information to reconstruct schedule evolution after training.
+\end{enumerate}
+
+\chapter{System Architecture and Repository Layout}
+
+\section{Recommended repository structure}
+
+Even if the baseline codebase already exists, the SAANS-specific additions should be isolated cleanly. A recommended structure is:
+
+\begin{lstlisting}[style=codeblock]
+docs/
+  saans_design_document.tex
+
+configs/
+  qm9_baseline.yaml
+  qm9_saans.yaml
+  geom_saans.yaml
+
+src/
+  data/
+    qm9.py
+    geom_drugs.py
+  models/
+    backbone_adapter.py
+  diffusion/
+    noising.py
+    losses.py
+  scheduler/
+    bins.py
+    baseline_sampler.py
+    hardness.py
+    tracker.py
+    saans_sampler.py
+  training/
+    trainer.py
+    hooks.py
+    checkpointing.py
+  eval/
+    generation.py
+    molecule_metrics.py
+    optimization_metrics.py
+  utils/
+    logging.py
+    seeding.py
+    geometry.py
+
+tests/
+  test_sampler_equivalence.py
+  test_importance_weighting.py
+  test_hardness_invariance.py
+  test_checkpoint_resume.py
+
+scripts/
+  run_qm9_baseline.sh
+  run_qm9_saans.sh
+  run_toy_sanity.sh
+\end{lstlisting}
+
+\section{Module responsibilities}
+
+\subsection{Backbone adapter}
+
+Because the baseline may come from an external repository, a small adapter layer should expose a stable internal API:
+
+\begin{itemize}[leftmargin=2em]
+    \item \texttt{forward(noisy\_batch, t)}
+    \item \texttt{loss\_fn(outputs, targets, return\_components=True)}
+    \item \texttt{sample(...)}
+\end{itemize}
+
+The goal is to prevent SAANS logic from depending on the exact internal conventions of the chosen diffusion implementation.
+
+\subsection{Scheduler subsystem}
+
+The scheduler subsystem should consist of four separate concepts:
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Bin definition:} maps timesteps to bins and stores $p_{0,b}$.
+    \item \textbf{Hardness builder:} converts detached loss components into invariant scalar hardness values.
+    \item \textbf{Tracker:} maintains EMA statistics and exposes smoothed difficulty estimates.
+    \item \textbf{Sampler:} converts tracked hardness into a valid adaptive distribution and returns importance weights.
+\end{enumerate}
+
+Keeping these components separate is critical for ablations. For example, hardness variants should not require editing the sampler itself.
+
+\section{Configuration design}
+
+The project should be fully config-driven. Suggested configuration fields include:
+
+\begin{lstlisting}[style=codeblock]
+scheduler:
+  enabled: true
+  num_bins: 32
+  alpha: 1.0
+  ema_beta: 0.95
+  baseline_mix_rho: 0.1
+  warmup_steps: 5000
+  hardness_type: coord_plus_feat
+  lambda_coord: 1.0
+  lambda_feat: 1.0
+  clip_weights: false
+  max_weight: null
+  log_every: 100
+\end{lstlisting}
+
+Other important configuration groups are dataset version, model backbone, training seed, precision mode, optimizer, and evaluation cadence.
+
+\chapter{Implementation Phases}
+
+\section{Phase 0: Baseline selection and reproduction}
+
+The first engineering decision is to choose one reliable E(3)-equivariant molecular diffusion baseline. The project should prefer a codebase that already has:
+
+\begin{itemize}[leftmargin=2em]
+    \item stable training scripts,
+    \item generation and evaluation utilities,
+    \item reproducible QM9 support,
+    \item a community-understood training objective.
+\end{itemize}
+
+\textbf{Exit criterion:} train and evaluate the baseline on QM9 with results that are at least directionally consistent with the original implementation or public reproductions.
+
+\section{Phase 1: Instrument the timestep pipeline}
+
+Before changing sampling behavior, identify and log the current timestep mechanics:
+
+\begin{enumerate}[leftmargin=2em]
+    \item where timesteps are sampled,
+    \item whether they are discrete, continuous, or transformed internally,
+    \item how noise is injected,
+    \item how the loss depends on timestep,
+    \item what per-sample losses are accessible.
+\end{enumerate}
+
+New instrumentation should log:
+
+\begin{itemize}[leftmargin=2em]
+    \item sampled timestep histogram,
+    \item mean and variance of loss per bin,
+    \item gradient norm statistics if affordable,
+    \item time-to-step and memory overhead.
+\end{itemize}
+
+\textbf{Exit criterion:} produce plots showing that different timestep regions exhibit different loss or variance behavior.
+
+\section{Phase 2: Implement the scheduler}
+
+This phase adds the binning, hardness tracking, adaptive probability computation, and importance weighting. It should be done incrementally:
+
+\begin{enumerate}[leftmargin=2em]
+    \item implement static bins and baseline bin masses,
+    \item implement a baseline-compatible sampler using those bins,
+    \item implement detached hardness aggregation,
+    \item implement EMA tracking,
+    \item implement adaptive $q_b$ generation,
+    \item integrate weighted loss computation,
+    \item add logging and checkpointing.
+\end{enumerate}
+
+\textbf{Exit criterion:} on a smoke test, training runs end-to-end with SAANS enabled and all diagnostics logged.
+
+\section{Phase 3: Correctness validation}
+
+Correctness validation is not optional. The project's credibility depends on showing that the adaptive sampler is not just a heuristic hack.
+
+Required tests:
+
+\begin{itemize}[leftmargin=2em]
+    \item \textbf{Estimator equivalence test:} on a synthetic loss function with known baseline expectation, verify that weighted adaptive estimates match the baseline expectation within Monte Carlo error.
+    \item \textbf{Support test:} verify $q_b > 0$ whenever $p_{0,b} > 0$.
+    \item \textbf{Recovery test:} verify that $\alpha=0$ or $\rho=1$ recovers the baseline.
+    \item \textbf{Invariance test:} rotate a batch rigidly and confirm the hardness statistic is unchanged up to numerical tolerance.
+    \item \textbf{Resume test:} save and reload a checkpoint and confirm the scheduler state matches bitwise or near-bitwise.
+\end{itemize}
+
+\textbf{Exit criterion:} all sampler tests pass before expensive experiments begin.
+
+\section{Phase 4: Toy sanity study}
+
+Before burning substantial GPU time, run a toy diffusion setting where the effect of adaptive sampling is easy to visualize. The toy study should answer two questions:
+
+\begin{enumerate}[leftmargin=2em]
+    \item does adaptive allocation change the sampled timestep distribution in the intended way?
+    \item under equal compute, does weighted adaptive sampling reduce optimization variance or reach a target loss faster?
+\end{enumerate}
+
+\textbf{Exit criterion:} produce at least one figure showing schedule evolution and one figure showing convergence behavior.
+
+\section{Phase 5: Main QM9 study}
+
+This is the primary course-project experiment set. At minimum, run:
+
+\begin{itemize}[leftmargin=2em]
+    \item baseline schedule,
+    \item uniform or log-uniform alternative if supported,
+    \item SAANS full method,
+    \item adaptive without importance weighting,
+    \item hardness ablation variants.
+\end{itemize}
+
+\textbf{Exit criterion:} obtain statistically credible trends across multiple seeds on QM9.
+
+\section{Phase 6: Harder benchmark or transfer validation}
+
+If results on QM9 are encouraging, run one stronger generalization study. The best candidate is a harder molecular dataset such as GEOM-Drugs, or a reduced subset of it if compute is limited.
+
+\textbf{Exit criterion:} show whether the method still helps in a more challenging regime. This stage is highly valuable for publication potential.
+
+\chapter{Experimental Design}
+
+\section{Research hypotheses}
+
+The experiments should be designed around explicit hypotheses rather than vague benchmarking.
+
+\begin{description}[leftmargin=2em, style=nextline]
+    \item[H1:] Different timestep regions contribute different levels of difficulty and optimization variance during equivariant diffusion training.
+    \item[H2:] A symmetry-safe adaptive sampler can improve compute allocation without changing the underlying objective in expectation.
+    \item[H3:] SAANS improves one or more of the following relative to static schedules: convergence speed, steps-to-target, wall-clock-to-target, gradient variance, or downstream generation quality.
+    \item[H4:] Importance weighting is necessary; removing it changes the objective and leads to inferior or less reliable behavior.
+    \item[H5:] Symmetry-safe hardness signals are more stable than naive non-invariant heuristics.
+\end{description}
+
+\section{Datasets}
+
+\subsection{Primary dataset: QM9}
+
+QM9 is the correct first benchmark because it is standard, comparatively small, and well-supported in many molecular generation codebases. It is the primary target for the course project and the right environment for debugging the adaptive scheduler.
+
+\subsection{Secondary dataset: GEOM-Drugs or equivalent}
+
+This stage is optional for course completion but strongly recommended for publication ambitions. Even a reduced but credible harder-benchmark study substantially strengthens the claim that the method is not a QM9-only optimization trick.
+
+\section{Main baselines}
+
+The design should compare against the strongest baselines available within the selected codebase and compute budget.
+
+\begin{enumerate}[leftmargin=2em]
+    \item \textbf{Baseline scheduler:} original training schedule used by the reference implementation.
+    \item \textbf{Uniform or log-uniform scheduler:} if the diffusion codebase supports alternative hand-designed schedules.
+    \item \textbf{SAANS:} full method with weighting and symmetry-safe hardness.
+    \item \textbf{Adaptive-no-weighting:} adaptive scheduler without importance correction.
+    \item \textbf{Hardness variants:} coordinate-only, feature-only, and combined hardness.
+\end{enumerate}
+
+\section{Primary metrics}
+
+The exact molecule-quality metrics depend on the baseline repository, but the evaluation suite should include three categories.
+
+\subsection{Generation quality}
+
+Use the baseline's standard molecular generation metrics wherever possible, such as validity, uniqueness, novelty, or geometry-related quality scores. Reusing the baseline's own evaluation protocol is important for fair comparison.
+
+\subsection{Optimization efficiency}
+
+These metrics are central to the project and should be emphasized in the paper:
+
+\begin{itemize}[leftmargin=2em]
+    \item steps-to-target metric threshold,
+    \item wall-clock time to target,
+    \item effective sample size of importance weights,
+    \item gradient variance or proxy variance across training,
+    \item area under the training-quality curve.
+\end{itemize}
+
+\subsection{Schedule diagnostics}
+
+These are essential for explaining \emph{why} the method works:
+
+\begin{itemize}[leftmargin=2em]
+    \item evolution of $q_b$ over training,
+    \item hardness per bin over training,
+    \item weight histogram over training,
+    \item bin occupancy histogram,
+    \item per-bin loss variance.
+\end{itemize}
+
+\section{Statistical protocol}
+
+To avoid overclaiming from noisy runs, the study should follow a simple but rigorous protocol:
+
+\begin{itemize}[leftmargin=2em]
+    \item use multiple random seeds for every main comparison,
+    \item keep evaluation cadence identical across methods,
+    \item report mean and standard deviation,
+    \item use matched compute budgets when comparing methods,
+    \item keep the backbone, optimizer, and dataset split fixed across scheduler variants.
+\end{itemize}
+
+\section{Ablation matrix}
+
+The minimum meaningful ablations are shown in Table~\ref{tab:ablations}.
+
+\begin{table}[H]
+    \centering
+    \caption{Recommended ablation matrix for the initial study.}
+    \label{tab:ablations}
+    \begin{tabular}{p{0.28\textwidth}p{0.62\textwidth}}
+        \toprule
+        \textbf{Ablation} & \textbf{Purpose} \\
+        \midrule
+        No weighting & Tests whether importance correction is necessary. \\
+        $\alpha$ sweep & Measures sensitivity to scheduler aggressiveness. \\
+        $\rho$ sweep & Measures stability / support trade-off from baseline mixing. \\
+        Number of bins $B$ & Tests discretization sensitivity. \\
+        Hardness type & Tests whether symmetry-safe signal choice matters. \\
+        Warmup length & Tests dependence on early-training schedule lock-in. \\
+        Optional weight clipping & Evaluates stability-bias trade-off if needed. \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\chapter{Diagnostics, Logging, and Visualization Plan}
+
+The project will be much stronger if diagnostics are treated as first-class outputs rather than debugging leftovers. The following plots should be intentionally designed from the start:
+
+\begin{enumerate}[leftmargin=2em]
+    \item timestep/bin occupancy over time,
+    \item EMA hardness trajectories per bin,
+    \item adaptive distribution heatmap over training,
+    \item importance weight histogram and effective sample size,
+    \item per-bin loss mean and variance,
+    \item training loss vs. wall-clock and vs. steps,
+    \item target metric attainment curves,
+    \item final molecule quality comparison table.
+\end{enumerate}
+
+Recommended logging backends are lightweight experiment trackers such as TensorBoard, CSV logs, or Weights \& Biases if available. The critical design rule is that every plotted quantity should also be stored in a machine-readable format for later paper figure generation.
+
+\chapter{Testing and Verification Strategy}
+
+\section{Unit tests}
+
+The test suite should not only check software behavior but also mathematical properties.
+
+\begin{longtable}{p{0.28\textwidth}p{0.64\textwidth}}
+\caption{Core unit tests for the SAANS implementation.}\label{tab:unit-tests} \\
+\toprule
+\textbf{Test} & \textbf{What it verifies} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Test} & \textbf{What it verifies} \\
+\midrule
+\endhead
+Sampler normalization & The returned adaptive distribution sums to one and has no negative entries. \\
+Baseline recovery & SAANS collapses to the baseline schedule under recovery settings. \\
+Importance estimator & Weighted adaptive estimates recover known expectations in synthetic settings. \\
+Bin mapping consistency & Timesteps map to the same bins during sampling and logging. \\
+Hardness invariance & Hardness summaries remain unchanged under rigid transformations. \\
+Checkpoint resume & Tracker state, bin masses, and config are restored exactly. \\
+Mixed-precision safety & No NaNs or infs arise in sampler statistics under AMP. \\
+\bottomrule
+\end{longtable}
+
+\section{Integration tests}
+
+Integration tests should run on tiny settings and confirm:
+
+\begin{itemize}[leftmargin=2em]
+    \item end-to-end training does not crash,
+    \item weighted loss backpropagates correctly,
+    \item scheduler state updates after each step,
+    \item metrics and diagnostics are logged as expected,
+    \item resume-from-checkpoint training matches a continuous run closely.
+\end{itemize}
+
+\section{Failure signals to monitor early}
+
+The following symptoms usually indicate bugs or design instability:
+
+\begin{itemize}[leftmargin=2em]
+    \item one or more bins collapse to near-zero occupancy unexpectedly,
+    \item importance weights explode or effective sample size collapses,
+    \item schedule oscillates wildly between bins,
+    \item hardness changes when the same molecule is rotated,
+    \item SAANS appears to help only because the objective changed after removing weights,
+    \item the overhead of the scheduler outweighs any training benefit.
+\end{itemize}
+
+\chapter{Compute Plan and Resource Strategy}
+
+\section{Resource tiers}
+
+The implementation should be planned against three resource tiers:
+
+\begin{description}[leftmargin=2em, style=nextline]
+    \item[Minimal tier:] one modern GPU, enough for smoke tests, toy studies, and limited QM9 experiments.
+    \item[Recommended tier:] one to two stronger GPUs or access to a cluster, enough for multi-seed QM9 experiments and selected ablations.
+    \item[Publication-capable tier:] additional cluster access for harder benchmarks, larger sweeps, or more extensive seed counts.
+\end{description}
+
+\section{Compute allocation strategy}
+
+The highest-value compute path is:
+
+\begin{enumerate}[leftmargin=2em]
+    \item use the smallest possible runs for correctness tests,
+    \item use moderate runs for scheduler hyperparameter selection,
+    \item reserve long runs for final baseline-vs-SAANS comparisons,
+    \item only after main QM9 evidence is positive, spend compute on the harder benchmark.
+\end{enumerate}
+
+\section{Reproducibility requirements}
+
+Every serious run should log:
+
+\begin{itemize}[leftmargin=2em]
+    \item git commit hash,
+    \item exact config file,
+    \item random seed,
+    \item hardware summary,
+    \item software versions,
+    \item checkpoint path,
+    \item dataset split identifier.
+\end{itemize}
+
+\chapter{Project Timeline and Deliverables}
+
+\section{Suggested 8-week plan}
+
+\begin{table}[H]
+    \centering
+    \caption{Recommended execution schedule.}
+    \begin{tabular}{p{0.12\textwidth}p{0.76\textwidth}}
+        \toprule
+        \textbf{Week} & \textbf{Target outcome} \\
+        \midrule
+        1 & Choose baseline, set up environment, reproduce at least a smoke-test training run. \\
+        2 & Reproduce baseline metrics on QM9 and instrument timestep diagnostics. \\
+        3 & Implement bins, tracker, and baseline-compatible sampler; add unit tests. \\
+        4 & Integrate full SAANS weighting and logging; run toy sanity study. \\
+        5 & Run main QM9 baseline-vs-SAANS comparisons with two to three seeds. \\
+        6 & Run ablations on hardness, $\alpha$, $\rho$, and warmup length. \\
+        7 & Produce final tables/plots and decide whether harder-benchmark extension is justified. \\
+        8 & Write report, polish figures, package code, and prepare presentation. \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+\section{Milestone deliverables}
+
+The design should target the following concrete artifacts:
+
+\begin{enumerate}[leftmargin=2em]
+    \item a reproducible baseline training script,
+    \item a scheduler module with unit tests,
+    \item a toy-sanity notebook or script,
+    \item a QM9 results folder with logs and plots,
+    \item a final report with method, diagnostics, and ablations,
+    \item a cleaned code release for submission or public sharing.
+\end{enumerate}
+
+\chapter{Risk Register and Mitigation}
+
+\begin{longtable}{p{0.26\textwidth}p{0.28\textwidth}p{0.34\textwidth}}
+\caption{Primary project risks and mitigation plan.}\label{tab:risk-register} \\
+\toprule
+\textbf{Risk} & \textbf{Why it matters} & \textbf{Mitigation} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{Risk} & \textbf{Why it matters} & \textbf{Mitigation} \\
+\midrule
+\endhead
+Baseline reproduction fails & Project cannot progress credibly without a stable starting point. & Choose a well-documented baseline first; verify reproduction before any SAANS code is written. \\
+Adaptive schedule is unstable & Large weight variance can erase benefits. & Use warmup, baseline mixing, close monitoring of weight histograms, and conservative $\alpha$. \\
+Hardness metric is poorly chosen & Scheduler may chase noise instead of true difficulty. & Start with simple invariant losses; compare coordinate-only and combined variants. \\
+No benefit on QM9 & Publication potential weakens. & Emphasize optimization diagnostics; test harder settings; avoid overfitting claims to one metric. \\
+Too many ablations & Project becomes broad but shallow. & Lock the minimum ablation set early and defer extras until main evidence exists. \\
+Compute bottleneck & Harder benchmark may become infeasible. & Prioritize QM9 correctness and quality first; use reduced harder benchmark only if justified. \\
+\bottomrule
+\end{longtable}
+
+\chapter{Paper Framing Strategy}
+
+If the empirical story is strong, the paper should be framed as an optimization-and-training paper for geometric generative models rather than as a new molecular architecture. A strong paper narrative is:
+
+\begin{enumerate}[leftmargin=2em]
+    \item fixed timestep schedules waste training effort in equivariant diffusion,
+    \item naive adaptation changes the objective or ignores symmetry concerns,
+    \item SAANS provides a principled, symmetry-safe adaptive allocation mechanism,
+    \item diagnostics show how the scheduler reallocates effort,
+    \item experiments show better compute efficiency and competitive or improved generation quality.
+\end{enumerate}
+
+The diagnostic story is almost as important as the final metric table. If the paper can show \emph{why} the method helps, not just \emph{that} it helps, the contribution becomes much more compelling.
+
+\chapter{Definition of Done}
+
+The project should be considered complete only when all of the following are true:
+
+\begin{itemize}[leftmargin=2em]
+    \item the baseline is reproduced and documented,
+    \item SAANS is implemented as a clean, modular subsystem,
+    \item correctness tests pass,
+    \item the main QM9 study is completed with multiple seeds,
+    \item at least the minimum ablation matrix is run,
+    \item all plots needed for the report are generated from logged data,
+    \item the final report can defend both the mathematical and engineering design decisions.
+\end{itemize}
+
+\appendix
+
+\chapter{Implementation Checklist}
+
+\begin{enumerate}[leftmargin=2em]
+    \item Select baseline repository and freeze commit hash.
+    \item Create config files for baseline and SAANS.
+    \item Add timestep/bin instrumentation before changing behavior.
+    \item Implement bin manager and baseline bin masses.
+    \item Implement hardness builder with invariant reductions.
+    \item Implement EMA tracker and serialization.
+    \item Implement adaptive distribution and importance weights.
+    \item Integrate weighted loss into the training loop.
+    \item Add tests for estimator correctness and invariance.
+    \item Run toy study, then QM9 study, then harder extension if justified.
+\end{enumerate}
+
+\chapter{Minimal Reporting Template}
+
+When writing the final report or paper, the results section should be able to answer the following questions directly:
+
+\begin{enumerate}[leftmargin=2em]
+    \item Which timesteps were hardest under the baseline?
+    \item How did SAANS reallocate sampling mass during training?
+    \item Did weighted adaptation improve efficiency under equal compute?
+    \item Did molecule quality improve, remain stable, or regress?
+    \item Was importance weighting necessary?
+    \item Did the symmetry-safe hardness design matter?
+    \item Did the result generalize beyond QM9?
+\end{enumerate}
+
+\end{document}

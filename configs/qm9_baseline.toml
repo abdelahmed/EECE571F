@@ -1,0 +1,11 @@
+[project]
+dataset = "qm9"
+mode = "baseline"
+
+[scheduler]
+enabled = false
+num_bins = 32
+alpha = 0.0
+ema_beta = 0.95
+baseline_mix_rho = 1.0
+hardness_type = "coord_only"

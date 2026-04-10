@@ -1,0 +1,13 @@
+[project]
+dataset = "qm9"
+mode = "saans"
+
+[scheduler]
+enabled = true
+num_bins = 32
+alpha = 1.0
+ema_beta = 0.95
+baseline_mix_rho = 0.1
+hardness_type = "coord_plus_feat"
+lambda_coord = 1.0
+lambda_feat = 1.0

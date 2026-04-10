@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+*.so
+.DS_Store
+.pytest_cache/
+.mypy_cache/
+.coverage
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+
+# LaTeX outputs
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+
+# Experiment outputs
+outputs/
+artifacts/
+checkpoints/
+
+# Vendored EDM baseline artifacts and downloaded data
+external/e3_diffusion_for_molecules/outputs/
+external/e3_diffusion_for_molecules/qm9/temp/
+external/e3_diffusion_for_molecules/generated_samples/
