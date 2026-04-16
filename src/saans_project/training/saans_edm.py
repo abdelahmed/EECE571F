@@ -85,6 +85,7 @@ def train_saans_batch_step(
     bin_manager: BinManager,
     tracker: EMAHardnessTracker,
     adaptive_sampler: AdaptiveBinSampler,
+    use_importance_weights: bool = True,
 ) -> SAANSEDMStepResult:
     if runtime.model is None or runtime.optim is None:
         runtime.build_model()
@@ -112,7 +113,10 @@ def train_saans_batch_step(
     coord_error = ((eps[:, :, :coord_dims] - net_out[:, :, :coord_dims]) ** 2).reshape(bs, -1).mean(dim=1)
     feat_error = ((eps[:, :, coord_dims:] - net_out[:, :, coord_dims:]) ** 2).reshape(bs, -1).mean(dim=1)
     total_error = 0.5 * (coord_error + feat_error)
-    sample_weights = torch.tensor(result.importance_weights, device=x.device, dtype=x.dtype)
+    if use_importance_weights:
+        sample_weights = torch.tensor(result.importance_weights, device=x.device, dtype=x.dtype)
+    else:
+        sample_weights = torch.ones_like(total_error)
     weighted_loss = torch.mean(sample_weights * total_error)
     weighted_loss.backward()
     runtime.optim.step()

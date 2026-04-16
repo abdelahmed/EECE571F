@@ -12,11 +12,11 @@ def main() -> None:
     env["PYTHONPATH"] = str(project_root / "src")
 
     scripts = [
-        "phase8_run_baseline_short.py",
+        "phase9_run_baseline_training.py",
         "phase9_run_saans_training.py",
         "phase9_run_no_weighting_training.py",
         "phase9_run_alpha_ablation_training.py",
-        "phase8_compare_short_runs.py",
+        "phase9_compare_runs.py",
     ]
 
     for script in scripts:

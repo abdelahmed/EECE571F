@@ -44,7 +44,7 @@ def main() -> None:
     max_steps = 1000
 
     for step, batch in enumerate(runtime.dataloaders["train"]):
-        result = train_saans_batch_step(runtime, batch, bins, tracker, sampler)
+        result = train_saans_batch_step(runtime, batch, bins, tracker, sampler, use_importance_weights=False)
         unweighted_loss = sum(result.per_sample_coord[i] * 0.5 + result.per_sample_feat[i] * 0.5 for i in range(len(result.per_sample_coord))) / len(result.per_sample_coord)
         train_losses.append(float(unweighted_loss))
         tracker_history.append(list(tracker.values))
