@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import torch
+
 from saans_project.baseline import EDMQM9Runtime, load_edm_qm9_config
 from saans_project.experiments import ShortRunResult, ensure_artifact_dir, save_result
 from saans_project.scheduler import AdaptiveBinSampler, BinManager, EMAHardnessTracker
@@ -15,7 +17,9 @@ EVAL_BATCHES = 2
 def main() -> None:
     project_root = Path(__file__).resolve().parents[1]
     cfg = load_edm_qm9_config(project_root / "configs" / "edm_qm9_saans_smoke.toml")
-    runtime = EDMQM9Runtime(cfg, project_root=project_root, device="cpu").prepare()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+    runtime = EDMQM9Runtime(cfg, project_root=project_root, device=device).prepare()
 
     bins = BinManager(num_bins=cfg.scheduler.num_bins)
     tracker = EMAHardnessTracker(num_bins=cfg.scheduler.num_bins, beta=cfg.scheduler.ema_beta)
