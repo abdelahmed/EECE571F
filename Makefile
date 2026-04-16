@@ -1,6 +1,6 @@
 PYTHON=python3
 
-.PHONY: demo test all-smokes phase2 phase3 phase4 phase5 phase6 phase7 phase8 phase8-baseline phase8-saans phase8-compare
+.PHONY: demo test all-smokes phase2 phase3 phase4 phase5 phase6 phase7 phase8 phase8-baseline phase8-saans phase8-compare phase9-saans-train
 
 demo:
 	PYTHONPATH=src $(PYTHON) scripts/smoke_demo.py
@@ -34,6 +34,9 @@ phase8-saans:
 
 phase8-compare:
 	PYTHONPATH=src $(PYTHON) scripts/phase8_compare_short_runs.py
+
+phase9-saans-train:
+	PYTHONPATH=src $(PYTHON) scripts/phase9_run_saans_training.py
 
 all-smokes:
 	PYTHONPATH=src $(PYTHON) scripts/run_all_smokes.py
